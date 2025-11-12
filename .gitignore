@@ -8,7 +8,7 @@ opencv-gpu/
 *.pt
 
 # Ignore all pickle files
-*.pickle
+*.pkl
 
 # Ignore any test scripts
 test*.py
