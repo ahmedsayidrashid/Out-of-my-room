@@ -1,0 +1,17 @@
+# Ignore all pycache files
+__pycache__/
+
+# Ignore all venv files
+opencv-gpu/
+
+# Ignore all .pt files
+*.pt
+
+# Ignore all pickle files
+*.pickle
+
+# Ignore any test scripts
+test*.py
+
+# Ignore view pickle file (for now)
+view_pickle.py
