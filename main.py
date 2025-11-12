@@ -4,6 +4,18 @@ import face_recognition as fr
 import numpy as np
 import torch
 import time
+import os
+import pickle
+from datetime import datetime
+
+# Twilio SMS imports
+try:
+    from twilio.rest import Client
+    import config
+    TWILIO_ENABLED = True
+except ImportError:
+    TWILIO_ENABLED = False
+    print("Warning: Twilio not installed. SMS alerts disabled. Install with: pip install twilio")
 
 
 def load_known_face(known_image_path: str):
@@ -40,6 +52,36 @@ def draw_face_recognition(frame, face_locations, face_names):
     return frame
 
 
+def send_sms_alert(message: str, last_sms_time: float) -> float:
+    """
+    Send SMS alert via Twilio with cooldown protection.
+    Returns the timestamp of when SMS was sent (or last_sms_time if not sent).
+    """
+    if not TWILIO_ENABLED:
+        return last_sms_time
+    
+    try:
+        # Check cooldown
+        current_time = time.time()
+        if current_time - last_sms_time < config.SMS_COOLDOWN_SECONDS:
+            print(f"SMS cooldown active. Next SMS allowed in {int(config.SMS_COOLDOWN_SECONDS - (current_time - last_sms_time))}s")
+            return last_sms_time
+        
+        # Send SMS
+        client = Client(config.TWILIO_ACCOUNT_SID, config.TWILIO_AUTH_TOKEN)
+        message_obj = client.messages.create(
+            body=message,
+            from_=config.TWILIO_FROM_NUMBER,
+            to=config.TWILIO_TO_NUMBER
+        )
+        print(f"✓ SMS sent successfully (SID: {message_obj.sid})")
+        return current_time
+        
+    except Exception as e:
+        print(f"Error sending SMS: {e}")
+        return last_sms_time
+
+
 def main():
     # Load YOLOv8 model (expects yolov8s.pt in repo root)
     model = YOLO("yolov8s.pt")
@@ -61,6 +103,36 @@ def main():
     # Throttled recognition logger
     last_log_time = 0.0
     pending_names = set()
+    last_sms_time = 0.0  # Track last SMS sent time for cooldown
+
+    # Unknown face database (persistent across runs)
+    unknown_db_path = "/home/ahmed/gitwork/get_vid_gpu/unknown_faces.pkl"
+    if os.path.exists(unknown_db_path):
+        try:
+            with open(unknown_db_path, "rb") as f:
+                unknown_db = pickle.load(f)
+        except Exception as e:
+            print(f"Warning: Could not load unknown faces database: {e}")
+            unknown_db = []
+    else:
+        unknown_db = []
+
+    def save_unknown_db():
+        """Save the unknown faces database to disk"""
+        try:
+            with open(unknown_db_path, "wb") as f:
+                pickle.dump(unknown_db, f)
+        except Exception as e:
+            print(f"Error saving unknown faces database: {e}")
+
+    def next_unknown_id() -> str:
+        """Generate next available unknown ID"""
+        existing = [int(entry["id"].split("_")[-1]) for entry in unknown_db 
+                   if entry.get("id", "").startswith("unk_") and entry["id"].split("_")[-1].isdigit()]
+        return f"unk_{(max(existing) + 1) if existing else 1}"
+
+    # Threshold for considering two unknown encodings the same person (lower = stricter)
+    unknown_match_tolerance = 0.7
 
     while True:
         ret, frame = video_capture.read()
@@ -93,12 +165,54 @@ def main():
             face_locations.append((int(top / scale), int(right / scale), int(bottom / scale), int(left / scale)))
 
         face_names = []
+        unknown_events = []  # Track new/returning unknown faces for logging
+        
         for face_encoding in face_encodings:
             matches = fr.compare_faces(known_face_encodings, face_encoding)
             name = "Unknown"
+            
             if True in matches:
+                # Known face recognized
                 first_match_index = matches.index(True)
                 name = known_face_names[first_match_index]
+            else:
+                # Unknown face - check against database
+                if unknown_db:
+                    stored_encodings = [entry["encoding"] for entry in unknown_db]
+                    distances = fr.face_distance(stored_encodings, face_encoding)
+                    best_idx = int(np.argmin(distances))
+                    best_dist = float(distances[best_idx])
+                else:
+                    best_idx = -1
+                    best_dist = 1.0
+
+                now_ts = time.time()
+                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                
+                if best_idx >= 0 and best_dist <= unknown_match_tolerance:
+                    # Previously seen unknown person - update their record
+                    entry = unknown_db[best_idx]
+                    entry["last_seen_ts"] = now_ts
+                    entry["last_seen"] = now_str
+                    entry["seen_count"] = entry.get("seen_count", 0) + 1
+                    name = entry["id"]
+                    unknown_events.append((name, now_str, "returning", entry.get("first_seen", "unknown")))
+                else:
+                    # New unknown person - create record
+                    uid = next_unknown_id()
+                    unknown_db.append({
+                        "id": uid,
+                        "encoding": face_encoding,
+                        "first_seen_ts": now_ts,
+                        "first_seen": now_str,
+                        "last_seen_ts": now_ts,
+                        "last_seen": now_str,
+                        "seen_count": 1,
+                    })
+                    name = uid
+                    unknown_events.append((uid, now_str, "new", None))
+                    save_unknown_db()  # Save immediately for new entries
+                    
             face_names.append(name)
 
         # Collect recognized names for throttled logging
@@ -106,14 +220,35 @@ def main():
             if name != "Unknown":
                 pending_names.add(name)
 
-        # Print at most every 0.5s if any names recognized
+        # Print at most every 0.5s if any names recognized or unknown faces detected
         now = time.time()
         if now - last_log_time >= 0.5:
             if pending_names:
                 print("Recognized:", ", ".join(sorted(pending_names)))
                 pending_names.clear()
-            else:
-                print("No names recognized")
+            
+            # Log unknown face events with details and send SMS alerts
+            if unknown_events:
+                for uid, timestamp, event_type, first_seen in unknown_events:
+                    if event_type == "new":
+                        print(f"NEW UNKNOWN: {uid} first detected at {timestamp}")
+                        
+                        # Send SMS alert for new unknown person
+                        if TWILIO_ENABLED and config.SEND_SMS_ON_NEW_UNKNOWN:
+                            sms_message = f"⚠️ ALERT: Unknown person ({uid}) detected in your room at {timestamp}"
+                            last_sms_time = send_sms_alert(sms_message, last_sms_time)
+                            
+                    else:
+                        print(f"RETURNING: {uid} seen again at {timestamp} (first seen: {first_seen})")
+                        
+                        # Optionally send SMS for returning unknowns
+                        if TWILIO_ENABLED and config.SEND_SMS_ON_RETURNING_UNKNOWN:
+                            sms_message = f"🔄 ALERT: Unknown person ({uid}) returned at {timestamp}"
+                            last_sms_time = send_sms_alert(sms_message, last_sms_time)
+                            
+                # Batch save after processing all events in this interval
+                save_unknown_db()
+            
             last_log_time = now
 
         # Draw face boxes and labels on top of YOLO annotations
