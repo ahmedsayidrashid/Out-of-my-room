@@ -4,19 +4,33 @@ import face_recognition as fr
 import numpy as np
 import torch
 import time
+import traceback
 import os
 import pickle
+from dotenv import load_dotenv
 from datetime import datetime
+from twilio.rest import Client
+from defs import DEFAULT_SEND_SMS_ON_NEW_UNKNOWN
+from defs import DEFAULT_SEND_SMS_ON_RETURNING_UNKNOWN 
+from defs import DEFAULT_SMS_COOLDOWN_SECONDS
+# Load environment variables
+load_dotenv()
 
-# Twilio SMS imports
-try:
-    from twilio.rest import Client
-    import config
-    TWILIO_ENABLED = True
-except ImportError:
-    TWILIO_ENABLED = False
-    print("Warning: Twilio not installed. SMS alerts disabled. Install with: pip install twilio")
+# Twilio configuration from .env file
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER")
+TWILIO_TO_NUMBER = os.getenv("TWILIO_TO_NUMBER")
 
+# SMS Settings (can be set in .env or use defaults)
+SEND_SMS_ON_NEW_UNKNOWN = os.getenv("SEND_SMS_ON_NEW_UNKNOWN", DEFAULT_SEND_SMS_ON_NEW_UNKNOWN if isinstance(DEFAULT_SEND_SMS_ON_NEW_UNKNOWN, bool) else True).lower() == "true"
+SEND_SMS_ON_RETURNING_UNKNOWN = os.getenv("SEND_SMS_ON_RETURNING_UNKNOWN", DEFAULT_SEND_SMS_ON_NEW_UNKNOWN if isinstance(DEFAULT_SEND_SMS_ON_RETURNING_UNKNOWN, bool) else False).lower() == "true"
+SMS_COOLDOWN_SECONDS = int(os.getenv("SMS_COOLDOWN_SECONDS", DEFAULT_SMS_COOLDOWN_SECONDS if isinstance(DEFAULT_SEND_SMS_ON_RETURNING_UNKNOWN, str) else "300"))
+
+# Check if Twilio is properly configured
+TWILIO_ENABLED = all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER, TWILIO_TO_NUMBER])
+if not TWILIO_ENABLED:
+    print("Warning: Twilio not configured. Please set TWILIO_* variables in .env file. SMS alerts disabled.")
 
 def load_known_face(known_image_path: str):
     known_face_encodings = []
@@ -63,22 +77,23 @@ def send_sms_alert(message: str, last_sms_time: float) -> float:
     try:
         # Check cooldown
         current_time = time.time()
-        if current_time - last_sms_time < config.SMS_COOLDOWN_SECONDS:
-            print(f"SMS cooldown active. Next SMS allowed in {int(config.SMS_COOLDOWN_SECONDS - (current_time - last_sms_time))}s")
+        if current_time - last_sms_time < SMS_COOLDOWN_SECONDS:
+            print(f"SMS cooldown active. Next SMS allowed in {int(SMS_COOLDOWN_SECONDS - (current_time - last_sms_time))}s")
             return last_sms_time
         
         # Send SMS
-        client = Client(config.TWILIO_ACCOUNT_SID, config.TWILIO_AUTH_TOKEN)
+        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
         message_obj = client.messages.create(
             body=message,
-            from_=config.TWILIO_FROM_NUMBER,
-            to=config.TWILIO_TO_NUMBER
+            from_=TWILIO_FROM_NUMBER,
+            to=TWILIO_TO_NUMBER
         )
         print(f"✓ SMS sent successfully (SID: {message_obj.sid})")
         return current_time
         
     except Exception as e:
         print(f"Error sending SMS: {e}")
+        print(traceback.format_exc())
         return last_sms_time
 
 
@@ -88,8 +103,10 @@ def main():
     # If PyTorch is built with ROCm on AMD, torch.cuda will be available and map to HIP
     use_gpu = torch.cuda.is_available()
     if use_gpu:
+        print("Using GPU")
         model.to("cuda")
-
+    else:
+        print("Using CPU")
     # Load known face (Ahmed)
     known_image_path = "/home/ahmed/Downloads/ahmed.png"
     known_face_encodings, known_face_names = load_known_face(known_image_path)
@@ -234,16 +251,16 @@ def main():
                         print(f"NEW UNKNOWN: {uid} first detected at {timestamp}")
                         
                         # Send SMS alert for new unknown person
-                        if TWILIO_ENABLED and config.SEND_SMS_ON_NEW_UNKNOWN:
-                            sms_message = f"⚠️ ALERT: Unknown person ({uid}) detected in your room at {timestamp}"
+                        if SEND_SMS_ON_NEW_UNKNOWN:
+                            sms_message = f"ALERT: Unknown person ({uid}) detected in your room at {timestamp}"
                             last_sms_time = send_sms_alert(sms_message, last_sms_time)
                             
                     else:
                         print(f"RETURNING: {uid} seen again at {timestamp} (first seen: {first_seen})")
                         
                         # Optionally send SMS for returning unknowns
-                        if TWILIO_ENABLED and config.SEND_SMS_ON_RETURNING_UNKNOWN:
-                            sms_message = f"🔄 ALERT: Unknown person ({uid}) returned at {timestamp}"
+                        if SEND_SMS_ON_RETURNING_UNKNOWN:
+                            sms_message = f"ALERT: Unknown person ({uid}) returned at {timestamp}"
                             last_sms_time = send_sms_alert(sms_message, last_sms_time)
                             
                 # Batch save after processing all events in this interval
