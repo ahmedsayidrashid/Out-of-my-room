@@ -18,3 +18,6 @@ view_pickle.py
 
 # ignore enviroment variable file
 .env
+
+# ignore local faces directory
+faces/
