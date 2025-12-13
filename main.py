@@ -13,9 +13,19 @@ from twilio.rest import Client
 from defs import DEFAULT_SEND_SMS_ON_NEW_UNKNOWN
 from defs import DEFAULT_SEND_SMS_ON_RETURNING_UNKNOWN 
 from defs import DEFAULT_SMS_COOLDOWN_SECONDS
+import ultralytics.nn.autobackend as ab
+import types
+
 # Load environment variables
 load_dotenv()
 
+# ROCm: disable fusion globally
+if torch.version.hip is not None:
+    def no_fuse(self, verbose=False):
+        # Simply return self without fusing
+        return self
+    ab.AutoBackend.fuse = no_fuse  # patch AutoBackend.fuse
+    
 # Twilio configuration from .env file
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
@@ -32,16 +42,65 @@ TWILIO_ENABLED = all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER,
 if not TWILIO_ENABLED:
     print("Warning: Twilio not configured. Please set TWILIO_* variables in .env file. SMS alerts disabled.")
 
-def load_known_face(known_image_path: str):
+def load_known_faces(faces_directory: str):
+    """
+    Load all known faces from a directory.
+    Each image file (jpg/png) becomes a known person, with filename as their name.
+    
+    Args:
+        faces_directory: Path to directory containing face images
+        
+    Returns:
+        Tuple of (encodings_list, names_list)
+    """
     known_face_encodings = []
     known_face_names = []
-
-    image = fr.load_image_file(known_image_path)
-    encodings = fr.face_encodings(image)
-    if len(encodings) > 0:
-        known_face_encodings.append(encodings[0])
-        print(encodings[0])
-        known_face_names.append("Ahmed")
+    
+    if not os.path.exists(faces_directory):
+        print(f"Warning: Faces directory '{faces_directory}' not found. Creating it...")
+        os.makedirs(faces_directory, exist_ok=True)
+        print(f"Please add face images (jpg/png) to {faces_directory}")
+        return known_face_encodings, known_face_names
+    
+    # Supported image extensions
+    image_extensions = ['.jpg', '.jpeg', '.png']
+    
+    # Scan directory for image files
+    image_files = []
+    for filename in os.listdir(faces_directory):
+        file_path = os.path.join(faces_directory, filename)
+        if os.path.isfile(file_path):
+            ext = os.path.splitext(filename)[1].lower()
+            if ext in image_extensions:
+                image_files.append((filename, file_path))
+    
+    if not image_files:
+        print(f"Warning: No face images found in '{faces_directory}'")
+        print(f"Add .jpg or .png files with person names (e.g., John.jpg, Sarah.png)")
+        return known_face_encodings, known_face_names
+    
+    # Load each face image
+    print(f"Loading known faces from '{faces_directory}'...")
+    for filename, file_path in image_files:
+        try:
+            # Extract person name from filename (without extension)
+            person_name = os.path.splitext(filename)[0]
+            
+            # Load and encode the face
+            image = fr.load_image_file(file_path)
+            encodings = fr.face_encodings(image)
+            
+            if len(encodings) > 0:
+                known_face_encodings.append(encodings[0])
+                known_face_names.append(person_name)
+                print(f"Loaded: {person_name} ({filename})")
+            else:
+                print(f"No face detected in: {filename}")
+                
+        except Exception as e:
+            print(f"Error loading {filename}: {e}")
+    
+    print(f"Total known faces loaded: {len(known_face_encodings)}")
     return known_face_encodings, known_face_names
 
 
@@ -98,18 +157,24 @@ def send_sms_alert(message: str, last_sms_time: float) -> float:
 
 
 def main():
-    # Load YOLOv8 model (expects yolov8s.pt in repo root)
-    model = YOLO("yolov8s.pt")
-    # If PyTorch is built with ROCm on AMD, torch.cuda will be available and map to HIP
-    use_gpu = torch.cuda.is_available()
-    if use_gpu:
-        print("Using GPU")
-        model.to("cuda")
-    else:
-        print("Using CPU")
-    # Load known face (Ahmed)
-    known_image_path = "/home/ahmed/Downloads/ahmed.png"
-    known_face_encodings, known_face_names = load_known_face(known_image_path)
+    # Set environment variable to help debug ROCm errors
+    os.environ["AMD_SERIALIZE_KERNEL"] = "3"
+    
+    # Load YOLOv8 model with fusing disabled for ROCm compatibility
+    os.environ["YOLO_DISABLE_FUSE"] = "1"
+    model = YOLO("yolov8s.pt", verbose=False)
+    
+    # Force CPU usage (GPU disabled due to compatibility issues)
+    use_gpu = False
+    print("Using CPU")
+    model.to("cpu")
+    
+    # Disable half precision on ROCm (causes issues with AMD GPUs)
+    yolo_half = False    
+    # Load all known faces from faces/ directory (relative to script location)
+    faces_directory = os.path.join(os.path.dirname(__file__), "faces")
+    print(f"Loading known faces from {faces_directory}")
+    known_face_encodings, known_face_names = load_known_faces(faces_directory)
 
     # Open webcam
     video_capture = cv2.VideoCapture(0, cv2.CAP_V4L2)
@@ -123,7 +188,7 @@ def main():
     last_sms_time = 0.0  # Track last SMS sent time for cooldown
 
     # Unknown face database (persistent across runs)
-    unknown_db_path = "/home/ahmed/gitwork/get_vid_gpu/unknown_faces.pkl"
+    unknown_db_path = os.path.join(os.path.dirname(__file__), "unknown_faces.pkl")
     if os.path.exists(unknown_db_path):
         try:
             with open(unknown_db_path, "rb") as f:
@@ -161,7 +226,7 @@ def main():
             frame,
             device=0 if use_gpu else "cpu",
             imgsz=640,
-            half=use_gpu,
+            half=yolo_half,
             verbose=False,
         )
         annotated = draw_yolo_detections(frame.copy(), yolo_results)
