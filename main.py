@@ -18,13 +18,6 @@ import types
 
 # Load environment variables
 load_dotenv()
-
-# ROCm: disable fusion globally
-if torch.version.hip is not None:
-    def no_fuse(self, verbose=False):
-        # Simply return self without fusing
-        return self
-    ab.AutoBackend.fuse = no_fuse  # patch AutoBackend.fuse
     
 # Twilio configuration from .env file
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
