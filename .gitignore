@@ -1,8 +1,8 @@
 # Ignore all pycache files
 __pycache__/
 
-# Ignore all venv files
-opencv-gpu/
+# Ignore the virtual environment
+venv/
 
 # Ignore all .pt files
 *.pt
@@ -10,13 +10,7 @@ opencv-gpu/
 # Ignore all pickle files
 *.pkl
 
-# Ignore any test scripts
-test*.py
-
-# Ignore view pickle file (for now)
-view_pickle.py
-
-# ignore enviroment variable file
+# ignore environment variable file
 .env
 
 # ignore local faces directory
